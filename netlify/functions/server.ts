@@ -1,8 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
+import { Redis } from "@upstash/redis";
 
-import type { Config } from "@netlify/functions";
+import type { Config, Context } from "@netlify/functions";
 
 // 1. Initialize MCP Server Instance
 const mcpServer = new McpServer({
@@ -23,6 +24,22 @@ mcpServer.tool(
   },
   async ({ url }) => {
     try {
+      // SSRF Prevention: Block local/private IPs and localhost
+      const targetUrl = new URL(url);
+      const hostname = targetUrl.hostname;
+      if (
+        hostname === "localhost" ||
+        hostname === "127.0.0.1" ||
+        hostname === "169.254.169.254" ||
+        hostname.match(/^10\./) ||
+        hostname.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./) ||
+        hostname.match(/^192\.168\./) ||
+        hostname.match(/^fd/) ||
+        hostname.endsWith(".local")
+      ) {
+        throw new Error("Fetching private or internal IPs is not allowed for security reasons.");
+      }
+
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000);
       const resp = await fetch(url, {
@@ -41,7 +58,11 @@ mcpServer.tool(
         };
       }
 
+      // Read max 2MB to prevent OOM
       const html = await resp.text();
+      if (html.length > 2000000) {
+        throw new Error("Web page is too large (>2MB).");
+      }
 
       // Fast Edge HTML Cleanup
       let cleaned = html
@@ -95,10 +116,15 @@ mcpServer.tool(
   async ({ owner, repo, aspect }) => {
     try {
       const baseUrl = `https://api.github.com/repos/${owner}/${repo}`;
-      const headers = {
+      const headers: Record<string, string> = {
         "User-Agent": "ContextHub-Worker/1.0",
         "Accept": "application/vnd.github.v3+json",
       };
+
+      // Increase rate limit if token is provided
+      if (process.env.GITHUB_TOKEN) {
+        headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
+      }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -259,11 +285,46 @@ export default async (request: Request): Promise<Response> => {
     }
 
     // Rate Limiting Logic for MCP Endpoints
-    const clientIP = request.headers.get("CF-Connecting-IP") || "anonymous";
+    const clientIP = request.headers.get("CF-Connecting-IP") || request.headers.get("x-forwarded-for") || "anonymous";
     const authKey = request.headers.get("Authorization")?.replace("Bearer ", "") || url.searchParams.get("key");
 
     if (!authKey) {
-      console.warn("Skipping rate limit check for free tier since KV is not bound on Netlify.");
+      if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+        try {
+          const redis = new Redis({
+            url: process.env.UPSTASH_REDIS_REST_URL,
+            token: process.env.UPSTASH_REDIS_REST_TOKEN,
+          });
+          
+          const today = new Date().toISOString().slice(0, 10);
+          const kvKey = `ratelimit:${clientIP}:${today}`;
+          const count = await redis.incr(kvKey);
+          
+          if (count === 1) {
+            await redis.expire(kvKey, 86400); // 24 hours
+          }
+          
+          const limit = parseInt(process.env.FREE_TIER_DAILY_LIMIT || "50", 10);
+          if (count > limit) {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32000, message: "Free daily rate limit of 50 requests reached. Add an API key for unlimited calls." },
+              }),
+              { status: 429, headers: { "Content-Type": "application/json" } }
+            );
+          }
+        } catch (e) {
+          console.warn("Redis rate limiting error:", e);
+        }
+      } else {
+        console.warn("Skipping rate limit check: UPSTASH_REDIS_REST_URL is not set.");
+      }
+    } else {
+      // Validate Pro API Key (Basic implementation, can be extended to check DB)
+      if (process.env.PRO_API_KEY && authKey !== process.env.PRO_API_KEY) {
+         return new Response("Unauthorized: Invalid API Key", { status: 401 });
+      }
     }
 
     // MCP Endpoint for streamableHttp protocol (stateless HTTP POST)
