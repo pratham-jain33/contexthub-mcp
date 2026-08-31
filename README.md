@@ -43,7 +43,7 @@ No installations. No terminal commands.
 ### For Cursor IDE:
 1. Open **Cursor Settings** ➔ **Features** ➔ **MCP Servers**
 2. Click **+ Add New MCP Server**
-3. Set Type to `SSE` and paste your deployment URL (e.g., `https://your-domain.com/sse`).
+3. Set Type to `SSE` and paste your deployment URL (e.g., `https://contexthub.netlify.app/sse`).
 4. Click **Save** and start prompting!
 
 ### For Claude Desktop:
