@@ -5,248 +5,245 @@ import { Redis } from "@upstash/redis";
 
 import type { Config, Context } from "@netlify/functions";
 
-// 1. Initialize MCP Server Instance
-const mcpServer = new McpServer({
-  name: "ContextHub-Edge",
-  version: "1.0.0",
-});
+// 1. Factory Function to Initialize MCP Server & Tools per Request
+function createMcpServer() {
+  const mcpServer = new McpServer({
+    name: "ContextHub-Edge",
+    version: "1.0.0",
+  });
 
-const transport = new WebStandardStreamableHTTPServerTransport({
-  sessionIdGenerator: undefined
-});
+  // TOOL 1: Clean Web-to-Markdown Extractor
+  mcpServer.tool(
+    "fetch_clean_markdown",
+    "Fetches any web page, strips scripts, styles, tracking, and ads, and returns clean, token-efficient Markdown for LLM reasoning.",
+    {
+      url: z.string().url().describe("The full HTTP/HTTPS URL of the web page to scrape"),
+    },
+    async ({ url }) => {
+      try {
+        // SSRF Prevention: Block local/private IPs and localhost
+        const targetUrl = new URL(url);
+        const hostname = targetUrl.hostname;
+        if (
+          hostname === "localhost" ||
+          hostname === "127.0.0.1" ||
+          hostname === "169.254.169.254" ||
+          hostname.match(/^10\./) ||
+          hostname.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./) ||
+          hostname.match(/^192\.168\./) ||
+          hostname.match(/^fd/) ||
+          hostname.endsWith(".local")
+        ) {
+          throw new Error("Fetching private or internal IPs is not allowed for security reasons.");
+        }
 
-// 2. TOOL 1: Clean Web-to-Markdown Extractor
-mcpServer.tool(
-  "fetch_clean_markdown",
-  "Fetches any web page, strips scripts, styles, tracking, and ads, and returns clean, token-efficient Markdown for LLM reasoning.",
-  {
-    url: z.string().url().describe("The full HTTP/HTTPS URL of the web page to scrape"),
-  },
-  async ({ url }) => {
-    try {
-      // SSRF Prevention: Block local/private IPs and localhost
-      const targetUrl = new URL(url);
-      const hostname = targetUrl.hostname;
-      if (
-        hostname === "localhost" ||
-        hostname === "127.0.0.1" ||
-        hostname === "169.254.169.254" ||
-        hostname.match(/^10\./) ||
-        hostname.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./) ||
-        hostname.match(/^192\.168\./) ||
-        hostname.match(/^fd/) ||
-        hostname.endsWith(".local")
-      ) {
-        throw new Error("Fetching private or internal IPs is not allowed for security reasons.");
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        const resp = await fetch(url, {
+          headers: {
+            "User-Agent": "ContextHub-Worker/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          },
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (!resp.ok) {
+          return {
+            content: [{ type: "text", text: `HTTP Error ${resp.status}: ${resp.statusText}` }],
+            isError: true,
+          };
+        }
+
+        // Read max 2MB to prevent OOM
+        const html = await resp.text();
+        if (html.length > 2000000) {
+          throw new Error("Web page is too large (>2MB).");
+        }
+
+        // Fast Edge HTML Cleanup
+        let cleaned = html
+          .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+          .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+          .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "")
+          .replace(/<header\b[^<]*(?:(?!<\/header>)<[^<]*)*<\/header>/gi, "")
+          .replace(/<footer\b[^<]*(?:(?!<\/footer>)<[^<]*)*<\/footer>/gi, "")
+          .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, "")
+          .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "");
+
+        // Convert common tags to Markdown equivalents
+        cleaned = cleaned
+          .replace(/<h1[^>]*>(.*?)<\/h1>/gi, "\n# $1\n")
+          .replace(/<h2[^>]*>(.*?)<\/h2>/gi, "\n## $1\n")
+          .replace(/<h3[^>]*>(.*?)<\/h3>/gi, "\n### $1\n")
+          .replace(/<li[^>]*>(.*?)<\/li>/gi, "\n* $1")
+          .replace(/<p[^>]*>(.*?)<\/p>/gi, "\n$1\n")
+          .replace(/<br\s*[\/]?>/gi, "\n")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&nbsp;/gi, " ")
+          .replace(/&amp;/gi, "&")
+          .replace(/&lt;/gi, "<")
+          .replace(/&gt;/gi, ">")
+          .replace(/\n\s*\n/g, "\n\n")
+          .trim();
+
+        const truncated = cleaned.length > 12000 ? cleaned.slice(0, 12000) + "\n\n[Content truncated for token efficiency]" : cleaned;
+
+        return {
+          content: [{ type: "text", text: truncated || "No readable text found on page." }],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: `Scraping error: ${e.message}` }],
+          isError: true,
+        };
       }
+    }
+  );
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-      const resp = await fetch(url, {
-        headers: {
+  // TOOL 2: GitHub Repository Inspector
+  mcpServer.tool(
+    "inspect_github_repo",
+    "Inspects an open-source GitHub repository for recent releases, open issues, commit activity, or file structure without cloning.",
+    {
+      owner: z.string().describe("GitHub owner/organization name (e.g. 'cloudflare')"),
+      repo: z.string().describe("Repository name (e.g. 'workers-sdk')"),
+      aspect: z.enum(["overview", "releases", "issues", "tree"]).default("overview").describe("The specific repo detail to inspect"),
+    },
+    async ({ owner, repo, aspect }) => {
+      try {
+        const baseUrl = `https://api.github.com/repos/${owner}/${repo}`;
+        const headers: Record<string, string> = {
           "User-Agent": "ContextHub-Worker/1.0",
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
+          "Accept": "application/vnd.github.v3+json",
+        };
 
-      if (!resp.ok) {
+        // Increase rate limit if token is provided
+        if (process.env.GITHUB_TOKEN) {
+          headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
+        }
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+        if (aspect === "overview") {
+          const res = await fetch(baseUrl, { headers, signal: controller.signal });
+          clearTimeout(timeoutId);
+          if (!res.ok) throw new Error(`GitHub API error: ${res.statusText}`);
+          const data: any = await res.json();
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  name: data.full_name,
+                  description: data.description,
+                  stars: data.stargazers_count,
+                  forks: data.forks_count,
+                  open_issues: data.open_issues_count,
+                  default_branch: data.default_branch,
+                  language: data.language,
+                  license: data.license?.spdx_id || "None",
+                  last_updated: data.updated_at,
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        if (aspect === "releases") {
+          const res = await fetch(`${baseUrl}/releases?per_page=3`, { headers, signal: controller.signal });
+          clearTimeout(timeoutId);
+          if (!res.ok) throw new Error(`GitHub API error: ${res.statusText}`);
+          const data: any = await res.json();
+          const simplified = data.map((r: any) => ({
+            tag: r.tag_name,
+            name: r.name,
+            published_at: r.published_at,
+            body_preview: r.body?.slice(0, 300) || "",
+          }));
+          return { content: [{ type: "text", text: JSON.stringify(simplified, null, 2) }] };
+        }
+
+        if (aspect === "issues") {
+          const res = await fetch(`${baseUrl}/issues?state=open&per_page=5`, { headers, signal: controller.signal });
+          clearTimeout(timeoutId);
+          if (!res.ok) throw new Error(`GitHub API error: ${res.statusText}`);
+          const data: any = await res.json();
+          const simplified = data.map((i: any) => ({
+            number: i.number,
+            title: i.title,
+            user: i.user?.login,
+            comments: i.comments,
+            created_at: i.created_at,
+          }));
+          return { content: [{ type: "text", text: JSON.stringify(simplified, null, 2) }] };
+        }
+
+        // Default tree
+        const res = await fetch(`${baseUrl}/contents`, { headers, signal: controller.signal });
+        clearTimeout(timeoutId);
+        const data: any = await res.json();
+        const files = Array.isArray(data) ? data.map((f: any) => ({ name: f.name, type: f.type })) : [];
+        return { content: [{ type: "text", text: JSON.stringify(files, null, 2) }] };
+      } catch (e: any) {
         return {
-          content: [{ type: "text", text: `HTTP Error ${resp.status}: ${resp.statusText}` }],
+          content: [{ type: "text", text: `GitHub inspection error: ${e.message}` }],
           isError: true,
         };
       }
-
-      // Read max 2MB to prevent OOM
-      const html = await resp.text();
-      if (html.length > 2000000) {
-        throw new Error("Web page is too large (>2MB).");
-      }
-
-      // Fast Edge HTML Cleanup
-      let cleaned = html
-        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
-        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
-        .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "")
-        .replace(/<header\b[^<]*(?:(?!<\/header>)<[^<]*)*<\/header>/gi, "")
-        .replace(/<footer\b[^<]*(?:(?!<\/footer>)<[^<]*)*<\/footer>/gi, "")
-        .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, "")
-        .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "");
-
-      // Convert common tags to Markdown equivalents
-      cleaned = cleaned
-        .replace(/<h1[^>]*>(.*?)<\/h1>/gi, "\n# $1\n")
-        .replace(/<h2[^>]*>(.*?)<\/h2>/gi, "\n## $1\n")
-        .replace(/<h3[^>]*>(.*?)<\/h3>/gi, "\n### $1\n")
-        .replace(/<li[^>]*>(.*?)<\/li>/gi, "\n* $1")
-        .replace(/<p[^>]*>(.*?)<\/p>/gi, "\n$1\n")
-        .replace(/<br\s*[\/]?>/gi, "\n")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/gi, " ")
-        .replace(/&amp;/gi, "&")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/\n\s*\n/g, "\n\n")
-        .trim();
-
-      const truncated = cleaned.length > 12000 ? cleaned.slice(0, 12000) + "\n\n[Content truncated for token efficiency]" : cleaned;
-
-      return {
-        content: [{ type: "text", text: truncated || "No readable text found on page." }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text", text: `Scraping error: ${e.message}` }],
-        isError: true,
-      };
     }
-  }
-);
+  );
 
-// 3. TOOL 2: GitHub Repository Inspector
-mcpServer.tool(
-  "inspect_github_repo",
-  "Inspects an open-source GitHub repository for recent releases, open issues, commit activity, or file structure without cloning.",
-  {
-    owner: z.string().describe("GitHub owner/organization name (e.g. 'cloudflare')"),
-    repo: z.string().describe("Repository name (e.g. 'workers-sdk')"),
-    aspect: z.enum(["overview", "releases", "issues", "tree"]).default("overview").describe("The specific repo detail to inspect"),
-  },
-  async ({ owner, repo, aspect }) => {
-    try {
-      const baseUrl = `https://api.github.com/repos/${owner}/${repo}`;
-      const headers: Record<string, string> = {
-        "User-Agent": "ContextHub-Worker/1.0",
-        "Accept": "application/vnd.github.v3+json",
-      };
-
-      // Increase rate limit if token is provided
-      if (process.env.GITHUB_TOKEN) {
-        headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
-      }
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-      if (aspect === "overview") {
-        const res = await fetch(baseUrl, { headers, signal: controller.signal });
+  // TOOL 3: Real-Time Market & Crypto Snapshot
+  mcpServer.tool(
+    "get_market_quote",
+    "Fetches live price, 24h volume, and 24h percentage change for cryptocurrencies or fiat pairs.",
+    {
+      symbol: z.string().describe("Crypto or Currency pair symbol, e.g., 'bitcoin', 'ethereum', 'solana'"),
+    },
+    async ({ symbol }) => {
+      try {
+        const cleanSymbol = symbol.toLowerCase().trim();
+        const url = `https://api.coingecko.com/api/v3/simple/price?ids=${cleanSymbol}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true`;
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        const res = await fetch(url, { headers: { "Accept": "application/json", "User-Agent": "ContextHub-Worker/1.0" }, signal: controller.signal });
         clearTimeout(timeoutId);
-        if (!res.ok) throw new Error(`GitHub API error: ${res.statusText}`);
+
+        if (!res.ok) throw new Error(`Market API returned status ${res.status}`);
         const data: any = await res.json();
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                name: data.full_name,
-                description: data.description,
-                stars: data.stargazers_count,
-                forks: data.forks_count,
-                open_issues: data.open_issues_count,
-                default_branch: data.default_branch,
-                language: data.language,
-                license: data.license?.spdx_id || "None",
-                last_updated: data.updated_at,
-              }, null, 2),
-            },
-          ],
+
+        if (!data[cleanSymbol]) {
+          return {
+            content: [{ type: "text", text: `Asset symbol '${symbol}' not found. Try 'bitcoin', 'ethereum', or 'solana'.` }],
+            isError: true,
+          };
+        }
+
+        const quote = {
+          asset: cleanSymbol.toUpperCase(),
+          price_usd: data[cleanSymbol].usd,
+          change_24h_pct: data[cleanSymbol].usd_24h_change?.toFixed(2) + "%",
+          volume_24h_usd: Math.round(data[cleanSymbol].usd_24h_vol || 0),
+          timestamp: new Date().toISOString(),
         };
-      }
 
-      if (aspect === "releases") {
-        const res = await fetch(`${baseUrl}/releases?per_page=3`, { headers, signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (!res.ok) throw new Error(`GitHub API error: ${res.statusText}`);
-        const data: any = await res.json();
-        const simplified = data.map((r: any) => ({
-          tag: r.tag_name,
-          name: r.name,
-          published_at: r.published_at,
-          body_preview: r.body?.slice(0, 300) || "",
-        }));
-        return { content: [{ type: "text", text: JSON.stringify(simplified, null, 2) }] };
-      }
-
-      if (aspect === "issues") {
-        const res = await fetch(`${baseUrl}/issues?state=open&per_page=5`, { headers, signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (!res.ok) throw new Error(`GitHub API error: ${res.statusText}`);
-        const data: any = await res.json();
-        const simplified = data.map((i: any) => ({
-          number: i.number,
-          title: i.title,
-          user: i.user?.login,
-          comments: i.comments,
-          created_at: i.created_at,
-        }));
-        return { content: [{ type: "text", text: JSON.stringify(simplified, null, 2) }] };
-      }
-
-      // Default tree
-      const res = await fetch(`${baseUrl}/contents`, { headers, signal: controller.signal });
-      clearTimeout(timeoutId);
-      const data: any = await res.json();
-      const files = Array.isArray(data) ? data.map((f: any) => ({ name: f.name, type: f.type })) : [];
-      return { content: [{ type: "text", text: JSON.stringify(files, null, 2) }] };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text", text: `GitHub inspection error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-// 4. TOOL 3: Real-Time Market & Crypto Snapshot
-mcpServer.tool(
-  "get_market_quote",
-  "Fetches live price, 24h volume, and 24h percentage change for cryptocurrencies or fiat pairs.",
-  {
-    symbol: z.string().describe("Crypto or Currency pair symbol, e.g., 'bitcoin', 'ethereum', 'solana'"),
-  },
-  async ({ symbol }) => {
-    try {
-      const cleanSymbol = symbol.toLowerCase().trim();
-      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${cleanSymbol}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true`;
-      
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-      const res = await fetch(url, { headers: { "Accept": "application/json", "User-Agent": "ContextHub-Worker/1.0" }, signal: controller.signal });
-      clearTimeout(timeoutId);
-
-      if (!res.ok) throw new Error(`Market API returned status ${res.status}`);
-      const data: any = await res.json();
-
-      if (!data[cleanSymbol]) {
         return {
-          content: [{ type: "text", text: `Asset symbol '${symbol}' not found. Try 'bitcoin', 'ethereum', or 'solana'.` }],
+          content: [{ type: "text", text: JSON.stringify(quote, null, 2) }],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: `Market quote error: ${e.message}` }],
           isError: true,
         };
       }
-
-      const quote = {
-        asset: cleanSymbol.toUpperCase(),
-        price_usd: data[cleanSymbol].usd,
-        change_24h_pct: data[cleanSymbol].usd_24h_change?.toFixed(2) + "%",
-        volume_24h_usd: Math.round(data[cleanSymbol].usd_24h_vol || 0),
-        timestamp: new Date().toISOString(),
-      };
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(quote, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text", text: `Market quote error: ${e.message}` }],
-        isError: true,
-      };
     }
-  }
-);
+  );
 
-// Connect the transport after registering all tools
-mcpServer.connect(transport).catch(console.error);
+  return mcpServer;
+}
 
 // 5. Worker Request Router with Rate Limiting & Web UI
 export default async (request: Request): Promise<Response> => {
@@ -327,8 +324,13 @@ export default async (request: Request): Promise<Response> => {
       }
     }
 
-    // MCP Endpoint for streamableHttp protocol (stateless HTTP POST)
+    // MCP Endpoint for streamableHttp / SSE protocol (stateless HTTP POST / GET)
     if (url.pathname === "/sse" || url.pathname === "/message") {
+      const server = createMcpServer();
+      const transport = new WebStandardStreamableHTTPServerTransport({
+        sessionIdGenerator: undefined
+      });
+      await server.connect(transport);
       return await transport.handleRequest(request);
     }
 
