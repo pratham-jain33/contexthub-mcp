@@ -1,0 +1,12 @@
+name = "contexthub-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "production"
+FREE_TIER_DAILY_LIMIT = "50"
+
+[[kv_namespaces]]
+binding = "CONTEXTHUB_KV"
+id = "f94fb008fe9247c08e96f1e673612285"

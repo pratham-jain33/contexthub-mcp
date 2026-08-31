@@ -1,0 +1,21 @@
+{
+  "name": "contexthub",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@cloudflare/workers-types": "^5.20260830.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@netlify/functions": "^6.0.0",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.127.1",
+    "zod": "^4.5.4"
+  }
+}
