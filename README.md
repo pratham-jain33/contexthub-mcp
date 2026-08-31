@@ -1,6 +1,6 @@
 <div align="center">
   
-# ⚡️ ContextHub
+# ⚡️ [ContextHub](https://context-hub.netlify.app/)
 
 **Instant AI Tools for Cursor & Claude. Zero Local Installs.**
 
