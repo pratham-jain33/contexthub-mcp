@@ -13,7 +13,6 @@ const mcpServer = new McpServer({
 const transport = new WebStandardStreamableHTTPServerTransport({
   sessionIdGenerator: undefined
 });
-mcpServer.connect(transport).catch(console.error);
 
 // 2. TOOL 1: Clean Web-to-Markdown Extractor
 mcpServer.tool(
@@ -219,6 +218,9 @@ mcpServer.tool(
     }
   }
 );
+
+// Connect the transport after registering all tools
+mcpServer.connect(transport).catch(console.error);
 
 // 5. Worker Request Router with Rate Limiting & Web UI
 export default async (request: Request): Promise<Response> => {
